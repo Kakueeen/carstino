@@ -31,7 +31,7 @@ DOWNLOAD_PATH = "{0}/Python-{0}.tar.xz"
 ENABLE_OPTIMIZE = "--enable-optimizations"
 # ipython need sqlite3 enable to store history
 ENABLE_SQLITE = "--enable-loadable-sqlite-extensions"
-INSTALL = "./configure {} && make && sudo make {}install"
+INSTALL = "./configure {} && make -j 10 && sudo make {}install"
 DEFAULT_DIR = "~/softwares"
 
 PREDEPENDS = {
