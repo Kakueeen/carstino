@@ -1,14 +1,28 @@
 #!/usr/bin/env python
+"""Generate virtual environment activate shell command.
+
+1. If venv/*/activate exists: print `source venv/*/activate`
+2. elif it's a poetry project: print `poetry shell`
+3. elif .venv/*/activate exists: print `source .venv/*/activate`
+"""
 import os
 import platform
 
 
 def run_cmd(command):
-    with os.popen(command) as p:
-        return p.read().strip()
+    # type: (str) -> str
+    with os.popen(command) as fp:
+        if not hasattr(fp, "_stream"):  # For python2
+            return fp.read().strip()
+        bf = fp._stream.buffer.read().strip()
+    try:
+        return bf.decode()
+    except UnicodeDecodeError:
+        return bf.decode("gbk")
 
 
 def read_content(filename):
+    # type: (str) -> bytes
     if not os.path.exists(filename):
         return b""
     with open(filename, "rb") as f:
@@ -16,6 +30,7 @@ def read_content(filename):
 
 
 def get_venv():
+    # type: () -> str
     is_windows = platform.platform().lower().startswith("windows")
     filename = "pyproject.toml"
     common_venv_names = ["venv"]
@@ -28,8 +43,8 @@ def get_venv():
             break
     else:
         if is_windows:
-            # I use Git Base at Windows, which does not show venv prefix
-            # after running `poetry shell`, so use `source ../activate` instead
+            # If use Git Base at Windows, which does not show venv prefix
+            # after running `poetry shell`, should use `source ../activate` instead
             cache_dir = run_cmd("poetry env info --path")
             if cache_dir:
                 try:
@@ -47,6 +62,7 @@ def get_venv():
 
 
 def main():
+    # type: () -> None
     shell_command_to_activate_virtual_env = get_venv()
     print(shell_command_to_activate_virtual_env)
 

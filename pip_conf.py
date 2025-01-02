@@ -22,8 +22,8 @@ Or:
     $ sudo python pip_conf.py --etc  # Set conf to /etc/pip.[conf|ini]
 """
 __author__ = "waketzheng@gmail.com"
-__updated_at__ = "2023.08.16"
-__version__ = "0.2.0"
+__updated_at__ = "2024.03.03"
+__version__ = "0.3.3"
 import os
 import platform
 import pprint
@@ -31,6 +31,11 @@ import re
 import socket
 import subprocess
 import sys
+
+try:
+    from typing import Optional  # NOQA:F401
+except ImportError:
+    pass
 
 """
 A sample of the pip.conf/pip.ini:
@@ -74,6 +79,7 @@ INDEX_URL = "https://{}/simple/"
 
 
 def is_pingable(domain):
+    # type: (str) -> bool
     if "/" in domain:
         domain = domain.split("/")[0]
     try:
@@ -83,29 +89,63 @@ def is_pingable(domain):
     return True
 
 
+def load_bool(name):
+    # type: (str) -> bool
+    v = os.getenv(name)
+    if not v:
+        return False
+    return v.lower() in ("1", "yes", "on", "true", "y")
+
+
 def is_tx_cloud_server():
+    # type: () -> bool
     return is_pingable(SOURCES["tx_ecs"])
 
 
 def is_ali_cloud_server():
+    # type: () -> bool
     return is_pingable(SOURCES["ali_ecs"])
 
 
 def is_hw_inner():
+    # type: () -> bool
     return is_pingable(SOURCES["hw_inner"])
 
 
 def parse_host(url):
+    # type: (str) -> str
     return url.split("://", 1)[1].split("/", 1)[0]
 
 
 def run_and_echo(cmd):
+    # type: (str) -> int
     print("--> " + cmd)
     sys.stdout.flush()
     return os.system(cmd)
 
 
+def patch_it(filename, tip="poetry i"):
+    # type: (str, str) -> Optional[int]
+    with open(filename) as f:
+        text = f.read()
+    if "install" not in text:
+        expand = (
+            "    if sys.argv[1:] and sys.argv[1] == 'i':\n"
+            "        sys.argv[1] = 'install'"
+        )
+        ss = text.strip().splitlines()
+        new_text = "\n".join(ss[:-1] + [expand] + ss[-1:])
+        try:
+            with open(filename, "w") as f:
+                f.write(new_text)
+        except IOError:
+            print("Failed to write lines to {}:\n{}".format(filename, expand))
+            return 1
+        print("i command was configured!\n\nUsage::\n\n    {}\n".format(tip))
+
+
 def config_by_cmd(url, is_windows=False):
+    # type: (str, bool) -> None
     if not is_windows and platform.system() == "Darwin":
         # MacOS need sudo to avoid PermissionError
         _config_by_cmd(url, sudo=True)
@@ -114,16 +154,25 @@ def config_by_cmd(url, is_windows=False):
 
 
 def _config_by_cmd(url, sudo=False):
+    # type: (str, bool) -> int
     cmd = CONF_PIP + url
     if not url.startswith("https"):
         print("cmd = {}".format(repr(cmd)))
-        cmd += " && pip config set install.trusted-host " + parse_host(url)
+        host = parse_host(url)
+        if host in SOURCES["hw_inner"]:
+            extra_host = host.replace("mirrors", "socapi").replace("tools", "cloudbu")
+            extra_index = SOURCES["hw_inner"].replace(host, extra_host)
+            extra_index_url = INDEX_URL.replace("https", "http").format(extra_index)
+            cmd += " && pip config set global.extra-index-url " + extra_index_url
+            host = '"{host} {extra_host}"'.format(host=host, extra_host=extra_host)
+        cmd += " && pip config set install.trusted-host " + host
     if sudo:
         cmd = " && ".join("sudo " + i.strip() for i in cmd.split("&&"))
     return run_and_echo(cmd)
 
 
 def detect_inner_net(source):
+    # type: (str) -> str
     args = sys.argv[1:]
     if not args or not [i for i in args if not i.startswith("-")]:
         if is_hw_inner():
@@ -145,6 +194,7 @@ def detect_inner_net(source):
 
 
 def build_index_url(source, force):
+    # type: (str, bool) -> str
     if source.startswith("http"):
         return source
     if not force:
@@ -157,6 +207,7 @@ def build_index_url(source, force):
 
 
 def get_conf_path(is_windows, at_etc):
+    # type: (bool, bool) -> str
     if is_windows:
         _pip_conf = ("pip", "pip.ini")
         conf_file = os.path.join(os.path.expanduser("~"), *_pip_conf)
@@ -173,6 +224,7 @@ def get_conf_path(is_windows, at_etc):
 
 
 def capture_output(cmd):
+    # type: (str) -> str
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True)
     except (TypeError, AttributeError):  # For python<=3.6
@@ -185,6 +237,7 @@ def capture_output(cmd):
 class PdmMirror:
     @staticmethod
     def set(url):
+        # type: (str) -> int
         cmd = "pdm config pypi.url " + url
         if url.startswith("http:"):
             cmd += " && pdm config pypi.verify_ssl false"
@@ -192,64 +245,123 @@ class PdmMirror:
 
 
 class PoetryMirror:
+    plugin_name = "poetry-plugin-pypi-mirror"
+
     def __init__(self, url, is_windows, replace):
+        # type: (str, bool, bool) -> None
         self.url = url
         self.is_windows = is_windows
         self.replace = replace
+        self._version = ""
+
+    def fix_poetry_v1_6_error(self, version):
+        # type: (str) -> None
+        if version < "1.6":
+            return
+        self.fix_v1_6_error()
+
+    @classmethod
+    def fix_v1_6_error(cls):
+        # type: () -> None
+        pipx_envs = capture_output("pipx environment")
+        key = "PIPX_HOME"
+        module = cls.plugin_name.replace("-", "_")
+        filename = "plugins.py"
+        if key in pipx_envs:
+            path = pipx_envs.split(key + "=")[1].splitlines()[0]
+            lib = os.path.join(path, "venvs/poetry/lib")
+            ds = os.listdir(lib)
+            file = os.path.join(lib, ds[0], "site-packages", module, filename)
+        else:
+            code = "import {} as m;print(m.__file__)".format(module)
+            path = capture_output("python -c {}".format(repr(code)))
+            file = os.path.join(os.path.dirname(path), filename)
+        if not os.path.exists(file):
+            print("WARNING: plugin file not found {}".format(file))
+            return
+        s = "semver"
+        with open(file) as f:
+            text = f.read()
+        if s in text:
+            text = text.replace(s, "constraints")
+            with open(file, "w") as f:
+                f.write(text)
+            print("pypi mirror plugin error fixed.")
+
+    @property
+    def poetry_version(self):
+        # type: () -> str
+        if not self._version:
+            self._version = self.get_poetry_version()
+        self.fix_poetry_v1_6_error(self._version)
+        return self._version
 
     @staticmethod
     def get_poetry_version():
+        # type: () -> str
         v = capture_output("poetry --version")
         return v.replace("Poetry (version ", "")
 
     @staticmethod
     def unset():
+        # type: () -> None
         print("By pipx:\n", "pipx runpip poetry uninstall <plugin-name>")
         print("By poetry self:\n", "poetry self remove <plugin-name>")
 
-    def get_dirpath(self, is_windows, url):
+    def check_installed(self):
+        # type: () -> Optional[bool]
         if run_and_echo("poetry --version") != 0:
             print("poetry not found!\nYou can install it by:")
             print("    pip install --user pipx")
             print("    pipx install poetry\n")
-            return
+            return True
+
+    def set_self_pypi_mirror(self, is_windows, url):
+        # type: (bool, str) -> None
+        config_path = self._get_dirpath(is_windows)
+        if not os.path.exists(os.path.join(config_path, "pyproject.toml")):
+            try:
+                from poetry.console.commands.self.self_command import SelfCommand
+            except ImportError:
+                pass
+            else:
+                SelfCommand().generate_system_pyproject()
+        cmds = [
+            "cd {}".format(config_path),
+            "poetry source add -v --priority=default pypi_mirror {}".format(url),
+        ]
+        run_and_echo(" && ".join(cmds))
+
+    def get_dirpath(self, is_windows, url):
+        # type: (bool, str) -> Optional[str]
+        if self.check_installed():
+            return None
         plugins = capture_output("poetry self show plugins")
-        mirror_plugin = "poetry-plugin-pypi-mirror"
+        mirror_plugin = self.plugin_name
         if mirror_plugin not in plugins:
             if run_and_echo("pipx --version") == 0:
                 install_plugin = "pipx inject poetry "
             else:
-                config_path = self._get_dirpath(is_windows)
-                if not os.path.exists(os.path.join(config_path, "pyproject.toml")):
-                    try:
-                        from poetry.console.commands.self.self_command import (
-                            SelfCommand,
-                        )
-                    except (ImportError, ModuleNotFoundError):
-                        pass
-                    else:
-                        SelfCommand().generate_system_pyproject()
-                set_self_pypi_mirror = (
-                    "cd {} && poetry source add -v --priority=default pypi_mirror {}"
-                )
-                run_and_echo(set_self_pypi_mirror.format(config_path, url))
+                self.set_self_pypi_mirror(is_windows, url)
                 install_plugin = "poetry self add "
             if run_and_echo(install_plugin + mirror_plugin) != 0:
                 print("Failed to install plugin: {}".format(repr(mirror_plugin)))
-                return
+                return None
         return self._get_dirpath(is_windows)
 
     def _get_dirpath(self, is_windows):
+        # type: (bool) -> str
         dirpath = "~/Library/Preferences/pypoetry/"
         if is_windows:
             dirpath = os.getenv("APPDATA", "") + "/pypoetry/"
         elif platform.system() != "Darwin":
             dirpath = "~/.config/pypoetry/"
-        elif self.get_poetry_version() >= "1.5":
+        elif self.poetry_version >= "1.5":
             dirpath = "~/Library/Application Support/pypoetry/"
         return os.path.expanduser(dirpath)
 
     def set(self):
+        # type: () -> Optional[int]
         filename = "config.toml"
         dirpath = self.get_dirpath(self.is_windows, self.url)
         if not dirpath:
@@ -262,7 +374,7 @@ class PoetryMirror:
                 content = f.read().strip()
             if text in content:
                 print("poetry mirror set as expected. Skip!")
-                return
+                return None
             if item in content:
                 pattern = r'\[plugins\.pypi_mirror\].url = "([^"]*)"'
                 m = re.search(pattern, content, re.S)
@@ -273,7 +385,7 @@ class PoetryMirror:
                         print(m.group())
                         print('If you want to replace it, rerun with "-y" in args.')
                         print("Exit!")
-                        return
+                        return None
                     text = content.replace(already, self.url)
             else:
                 text = content + os.linesep + text
@@ -283,6 +395,9 @@ class PoetryMirror:
                 os.mkdir(parent)
             os.mkdir(dirpath)
         do_write(config_toml_path, text)
+        poetry_file = capture_output("which poetry")
+        if poetry_file and os.path.exists(poetry_file):
+            patch_it(poetry_file)
 
 
 def init_pip_conf(
@@ -293,13 +408,15 @@ def init_pip_conf(
     poetry=False,
     pdm=False,
 ):
+    # type: (str, bool, bool, bool, bool, bool) -> Optional[int]
     is_windows = platform.system() == "Windows"
-    if poetry:
+    if poetry or load_bool("SET_POETRY"):
         return PoetryMirror(url, is_windows, replace).set()
     if pdm:
         return PdmMirror.set(url)
     if not write and (not at_etc or is_windows) and can_set_global():
-        return config_by_cmd(url, is_windows)
+        config_by_cmd(url, is_windows)
+        return None
     text = TEMPLATE.format(url, parse_host(url))
     conf_file = get_conf_path(is_windows, at_etc)
     if os.path.exists(conf_file):
@@ -307,16 +424,17 @@ def init_pip_conf(
             s = fp.read()
         if text in s:
             print("Pip source already be configured as expected.\nSkip!")
-            return
+            return None
         if not replace:
             print("The pip file {} exists! content:".format(conf_file))
             print(s)
             print('If you want to replace it, rerun with "-y" in args.\nExit!')
-            return
+            return None
     do_write(conf_file, text)
 
 
 def do_write(conf_file, text):
+    # type: (str, str) -> None
     with open(conf_file, "w") as fp:
         fp.write(text + "\n")
     print("Write lines to `{}` as below:\n{}\n".format(conf_file, text))
@@ -324,6 +442,7 @@ def do_write(conf_file, text):
 
 
 def can_set_global():
+    # type: () -> bool
     s = capture_output("pip --version")
     m = re.search(r"^pip (\d+)\.(\d+)", s)
     if not m:
@@ -332,6 +451,7 @@ def can_set_global():
 
 
 def main():
+    # type: () -> Optional[int]
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
@@ -349,6 +469,9 @@ def main():
     parser.add_argument("--poetry", action="store_true", help="Set mirrors for poetry")
     parser.add_argument("--pdm", action="store_true", help="Set pypi.url for pdm")
     parser.add_argument("--url", action="store_true", help="Show mirrors url")
+    parser.add_argument(
+        "--fix", action="store_true", help="Fix poetry pypi mirror plugin error"
+    )
     if not sys.argv[1:]:
         # In case of runing by curl result, try to get args from ENV
         env = os.getenv("PIP_CONF_ARGS")
@@ -358,26 +481,24 @@ def main():
     if args.list:
         print("There are several mirrors that can be used for pip/poetry:")
         pprint.pprint(SOURCES)
+    elif args.fix:
+        PoetryMirror.fix_v1_6_error()
     else:
         source = args.name or args.source
         url = build_index_url(source, args.f)
         if args.url:
             print(url)
-            return
+            return None
         if init_pip_conf(url, args.y, args.etc, args.write, args.poetry, args.pdm):
-            sys.exit(1)
+            return 1
 
 
 if __name__ == "__main__":
     if "--url" not in sys.argv:
-        try:
-            ImportError = ModuleNotFoundError
-        except NameError:  # For python2
-            pass
         try:
             from kitty import timeit
         except (ImportError, SyntaxError, AttributeError):
             pass
         else:
             main = timeit(main)
-    main()
+    sys.exit(main())

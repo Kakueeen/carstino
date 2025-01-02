@@ -7,22 +7,28 @@ And python3.6+ is required.
 import re
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 from platform import platform
 from typing import Optional
 
 FILES = ALIAS_FILE, *_ = [
     ".bash_aliases",
-    ".mg.py",
     ".vimrc",
+    ".mg.py",
     ".lint.sh",
 ]
 
-PACKAGES = "ipython ruff black isort mypy"
+PACKAGES = "ipython 'fast-dev-cli[all]'"
 IS_WINDOWS = platform().lower().startswith("win")
 
 
-def get_cmd_result(cmd: str) -> str:
+@lru_cache(8)
+def no_input() -> bool:
+    return "--no-input" in sys.argv
+
+
+def get_cmd_output(cmd: str) -> str:
     ret = subprocess.run(cmd, shell=True, capture_output=True)
     return ret.stdout.decode().strip()
 
@@ -33,7 +39,7 @@ def run_cmd(command: str) -> int:
 
 
 def get_shell() -> str:
-    return Path(get_cmd_result("echo $SHELL")).name
+    return Path(get_cmd_output("echo $SHELL")).name
 
 
 def set_alias_for_git(home: Path) -> None:
@@ -107,7 +113,7 @@ def update_aliases(repo: Path, aliases_path: Path, home) -> str:
                 script_path = repo / script
                 new_path = script_path.as_posix().replace(Path.home().as_posix(), "~")
                 ss = ss.replace(f'{stem}="{path}"', f'{stem}="{new_path}"')
-    if run_cmd("which vi") and "alias vi=" not in get_cmd_result("alias"):
+    if run_cmd("which vi") and "alias vi=" not in get_cmd_output("alias"):
         ss += "alias vi=vim\n"
     if s != ss:
         aliases_path.write_text(ss)
@@ -115,7 +121,7 @@ def update_aliases(repo: Path, aliases_path: Path, home) -> str:
     return ss
 
 
-def get_rc_file(home) -> Path:
+def get_rc_file(home: Path) -> Path:
     names = [".zshrc", ".bashrc", ".profile", ".zprofile", ".bash_profile"]
     for name in names:
         rc = home / name
@@ -126,7 +132,7 @@ def get_rc_file(home) -> Path:
             rc = home / names[-1]
             rc.touch()
             return rc
-        raise Exception(f"Startup file not found, including {names!r}")
+        raise OSError(f"Startup file not found, including {names!r}")
     return rc
 
 
@@ -137,36 +143,60 @@ def init_pip_source(home: Path, repo: Path) -> None:
         print("pip source already config as follows:\n\n")
         print(p.read_bytes().decode())
         tip = f"\nDo you want to rerun ./{swith_pip_source.name}? [y/N] "
-        if input(tip).lower() == "y":
-            run_cmd(f"{swith_pip_source}")
+        if not no_input() and input(tip).lower() == "y":
+            run_cmd(f"python {swith_pip_source}")
     else:
-        run_cmd(f"{swith_pip_source}")
+        run_cmd(f"python {swith_pip_source}")
 
 
-def upgrade_pip_and_install_pipx() -> None:
-    run_cmd("python3 -m pip install --upgrade --user pip")
-    run_cmd("python3 -m pip install --user --upgrade pipx")
-    run_cmd("python3 -m pipx ensurepath")
-    if run_cmd("pipx install --upgrade poetry") == 0:
-        run_cmd("./pip_conf.py --poetry")
+def upgrade_pip_and_install_pipx(home: Path) -> str:
+    pipx = "pipx"
+    if run_cmd("which pipx") != 0:
+        pipx_file = home / ".local/bin/pipx"
+        if pipx_file.exists():
+            pipx = pipx_file.as_posix()
+        else:
+            r = run_cmd("python3 -m pip install --upgrade --user pipx")
+            if r == 0 and pipx_file.exists():
+                pipx = pipx_file.as_posix()
+    if run_cmd("which poetry") != 0:
+        if run_cmd(f"{pipx} install poetry") == 0:
+            run_cmd("python pip_conf.py --poetry")
+    return pipx
 
 
-def main():
+def main() -> None:
+    command = sys.argv[1:] and sys.argv[1]
+    if command == "dog":
+        set_alias_for_git(Path.home())
+        return
     home = Path.home()
     aliases_path = home / ALIAS_FILE
     if aliases_path.exists():
         a = input(f"`{aliases_path}` exists. Continue and replace it?[y/(n)] ")
-        if not a.lower().strip().startswith("y"):
+        if not no_input() and not a.lower().strip().startswith("y"):
             return
+    if command == "alias":
+        run_cmd("[[ -f ~/.bash_aliases ]] || cp .bash_aliases ~/")
+        run_cmd("[[ -f ~/.vimrc ]] || cp .vimrc ~/")
+        run_cmd("echo '[[ -f ~/.bash_aliases ]] && . ~/.bash_aliases' >>  ~/.zshrc")
+        return
     run_init(home, aliases_path)
 
 
-def run_init(home, aliases_path):
+def run_init(home: Path, aliases_path: Path) -> None:
     repo = get_dirpath()
     init_pip_source(home, repo)
-    upgrade_pip_and_install_pipx()
-    for fn in FILES:
-        run_cmd(f"cp {repo / fn} {home}")
+    pipx = upgrade_pip_and_install_pipx(home)
+    user_special_files = FILES[:2]
+    general_files = FILES[2:]
+    if not IS_WINDOWS:
+        general_files.append(".pipi.py")
+    for fp in user_special_files:
+        run_cmd(f"cp {repo/fp} {home}")
+    for fn in general_files:
+        if run_cmd(f"ln -s {repo/fn} {home/fn}") == 0:
+            run_cmd(f"chmod +x {home/fn}")
     update_aliases(repo, aliases_path, home)
     if "macos" in platform().lower():
         ctl_name = "systemctl.py"
@@ -178,14 +208,16 @@ def run_init(home, aliases_path):
     rc = get_rc_file(home)
     configure_aliases(rc)
     # Install some useful python modules
-    if run_cmd(f"python3 -m pip install --upgrade --user {PACKAGES}") != 0:
-        if IS_WINDOWS:
-            a = input(f"Failed to install {PACKAGES}. Continue?[(y)/n] ")
-            if a.lower().strip().startswith("n"):
-                sys.exit(1)
-        elif run_cmd(f"sudo pip3 install -U {PACKAGES}") != 0:
-            print("Please install python3-pip and then rerun this script.")
-            sys.exit(1)
+    if "--prod" not in sys.argv and PACKAGES:
+        for pkg in PACKAGES.split():
+            if run_cmd(f"{pipx} install {pkg}") != 0:
+                if IS_WINDOWS:
+                    a = input(f"Failed to install {PACKAGES}. Continue?[(y)/n] ")
+                    if not no_input() and a.lower().strip().startswith("n"):
+                        sys.exit(1)
+                elif run_cmd(f"pip3 install --upgrade --user {PACKAGES}") != 0:
+                    print("Please install python3-pip and then rerun this script.")
+                    sys.exit(1)
     # Activate installed python package scripts, such as: ipython, ruff
     configure_path(rc)
     # Reactive rc file
@@ -196,7 +228,4 @@ def run_init(home, aliases_path):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] and sys.argv[1] == "dog":
-        set_alias_for_git(Path.home())
-    else:
-        main()
+    main()

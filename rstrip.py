@@ -22,12 +22,40 @@ import os
 import re
 import sys
 
+try:
+    from enum import StrEnum
+except ImportError:
+    try:
+        from enum import Enum
+    except ImportError:  # For python2
+
+        class AttrIter(type):
+            def __iter__(cls):
+                return [
+                    v
+                    for k, v in cls.__dict__.items()
+                    if not k.startswith("_") and isinstance(v, str)
+                ]
+
+        class StrEnum(object):  # type:ignore
+            __metaclass__ = AttrIter
+
+    else:
+
+        class StrEnum(str, Enum):  # type:ignore
+            __str__ = str.__str__
+
+
+class LineBreakChoices(StrEnum):
+    win = r"\r\n"
+    unix = r"\n"
+
 
 class ContentException(Exception):
     pass
 
 
-def rstrip_file(fname, newlines=1):
+def rstrip_file(fname, newlines=1, linesep=None):
     try:
         with open(fname) as fp:
             s = fp.read()
@@ -37,7 +65,7 @@ def rstrip_file(fname, newlines=1):
     if not s:
         raise ContentException("Empty file.")
     ss = [line.rstrip() for line in s.rstrip().split("\n")]
-    n = os.linesep
+    n = linesep or os.linesep
     required = n.join(ss) + n * newlines
     with open(fname, "rb") as fp:
         byt = fp.read()
@@ -68,6 +96,7 @@ def parse_args():
         "-t", "--type", default="*", help="Filter file type(Example: *.py)"
     )
     parser.add_argument("-d", "--dir", default="", help="The directory path")
+    parser.add_argument("-b", "--br", default="", help=r"Line break(Example: '\r\n')")
     parser.add_argument(
         "files",
         nargs="+",
@@ -160,11 +189,24 @@ def main():
         print(__doc__)
         return
     args = parse_args()
+    linesep = args.br
+    if linesep:
+        if linesep == "rn":  # python2 get '\r\n' to be 'rn'
+            linesep = "\r\n"
+        elif linesep == "n":
+            linesep = "\n"
+        else:
+            choices = [i.value for i in LineBreakChoices]
+            if linesep not in choices:
+                print("linesep: {}".format(repr(linesep)))
+                print("br must be one of this: {}".format(choices))
+                return
+            linesep = "\r\n" if linesep == LineBreakChoices.win else "\n"
     files = get_filepaths(args)
     count_skip = count_rstrip = 0
     for fn in files:
         try:
-            rstrip_file(fn)
+            rstrip_file(fn, linesep=linesep)
         except ContentException as e:
             count_skip += 1
             print("{}: skip! {}".format(fn, e))
